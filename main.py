@@ -14,8 +14,8 @@ import aiosqlite
 import discord
 import feedparser
 import httpx
-import trafilatura
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from loguru import logger
 from mistralai.client import Mistral
@@ -294,22 +294,51 @@ async def extract_article_content(url: str) -> str | None:
             resp = await client.get(url)
             if resp.status_code != 200:
                 return None
+            content_type = resp.headers.get("content-type", "").lower()
+            if "text/html" not in content_type and "text/plain" not in content_type:
+                return None
             raw_html = resp.text
     except Exception as e:
         logger.debug(f"[Extract] HTTP failed for {url[:80]}: {e}")
         return None
 
     try:
-        text = trafilatura.extract(
-            raw_html,
-            include_comments=False,
-            include_tables=False,
-            favor_precision=True,
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+        for tag in soup([
+            "script", "style", "nav", "footer", "header",
+            "aside", "form", "noscript", "iframe", "svg",
+        ]):
+            tag.decompose()
+
+        main = (
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(attrs={"role": "main"})
+            or soup.find(class_=re.compile(
+                r"(article|post|content|entry|story|body)", re.I
+            ))
+            or soup.body
+            or soup
         )
-        if text and len(text.strip()) > 100:
-            return text.strip()
+
+        paragraphs = main.find_all(["p", "h2", "h3"])
+        text_parts: list[str] = []
+        seen: set[str] = set()
+        for p in paragraphs:
+            t = p.get_text(" ", strip=True)
+            t = re.sub(r"\s+", " ", t)
+            if len(t) > 40 and t not in seen:
+                seen.add(t)
+                text_parts.append(t)
+
+        text = "\n\n".join(text_parts)
+        if len(text) > 150:
+            return text
+
     except Exception as e:
         logger.debug(f"[Extract] Parse failed for {url[:80]}: {e}")
+
     return None
 
 
@@ -393,7 +422,11 @@ class HackerNewsFetcher(BaseFetcher):
                 comments = await fetch_hn_comments(hit["objectID"])
 
             if not content and comments:
-                content = "Bài viết là link ngoài không truy cập được. Dưới đây là thảo luận cộng đồng:\n\n" + "\n\n".join(comments)
+                content = (
+                    "Bài viết là link ngoài không truy cập được. "
+                    "Dưới đây là thảo luận cộng đồng:\n\n"
+                    + "\n\n".join(comments)
+                )
 
             if len(content) < 150:
                 logger.debug(f"[HN] Skip '{title[:60]}' - content too short ({len(content)} chars)")
@@ -638,7 +671,9 @@ class RSSFetcher(BaseFetcher):
 
     async def fetch(self) -> list[Article]:
         try:
-            async with httpx.AsyncClient(timeout=30, headers={"User-Agent": USER_AGENT}) as client:
+            async with httpx.AsyncClient(
+                timeout=30, headers={"User-Agent": USER_AGENT}
+            ) as client:
                 resp = await client.get(self.rss_url)
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.text)
@@ -782,18 +817,14 @@ def get_prompt(category: str) -> str:
     return NEWS_PROMPT
 
 
-async def summarize(
-    client: Mistral, article: Article
-) -> dict | None:
+async def summarize(client: Mistral, article: Article) -> dict | None:
     content = article.content[:7000]
     prompt_template = get_prompt(article.category)
 
     if article.category == "news":
         if article.comments:
             comments_text = "\n\n".join(f"- {c}" for c in article.comments[:5])
-            comments_section = (
-                "Thảo luận cộng đồng (từ Hacker News):\n" + comments_text
-            )
+            comments_section = "Thảo luận cộng đồng (từ Hacker News):\n" + comments_text
         else:
             comments_section = ""
         prompt = prompt_template.format(
@@ -944,8 +975,8 @@ def build_news_embed(article: Article, summary: dict) -> discord.Embed:
         embed.description = f"**📌 TÓM TẮT**\n{truncate(tldr, 800)}"
 
     key_points = summary.get("key_points", [])
-    if key_points:
-        value = "\n".join(f"• {truncate(p, 200)}" for p in key_points[:5])
+    if isinstance(key_points, list) and key_points:
+        value = "\n".join(f"• {truncate(str(p), 200)}" for p in key_points[:5])
         embed.add_field(name="🔑 ĐIỂM CHÍNH", value=truncate(value, 1000), inline=False)
 
     context = summary.get("context", "")
@@ -959,13 +990,13 @@ def build_news_embed(article: Article, summary: dict) -> discord.Embed:
     if article.comments:
         comment_text = "\n".join(f"• {truncate(c, 180)}" for c in article.comments[:4])
         embed.add_field(
-            name=f"💬 THẢO LUẬN CỘNG ĐỒNG ({article.metadata.get('comments', 0)} comments)",
+            name=f"💬 THẢO LUẬN ({article.metadata.get('comments', 0)} comments)",
             value=truncate(comment_text, 900),
             inline=False,
         )
 
     tags = summary.get("tags", [])
-    if tags:
+    if isinstance(tags, list) and tags:
         tag_str = " · ".join(f"`{t}`" for t in tags[:6])
         embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
 
@@ -1008,7 +1039,7 @@ def build_paper_embed(article: Article, summary: dict) -> discord.Embed:
 
     results = summary.get("results", [])
     if isinstance(results, list) and results:
-        value = "\n".join(f"• {truncate(r, 250)}" for r in results[:5])
+        value = "\n".join(f"• {truncate(str(r), 250)}" for r in results[:5])
         embed.add_field(name="📊 KẾT QUẢ", value=truncate(value, 1000), inline=False)
     elif isinstance(results, str) and results:
         embed.add_field(name="📊 KẾT QUẢ", value=truncate(results, 900), inline=False)
@@ -1022,11 +1053,11 @@ def build_paper_embed(article: Article, summary: dict) -> discord.Embed:
         embed.add_field(name="💼 ỨNG DỤNG", value=truncate(applications, 800), inline=False)
 
     tags = summary.get("tags", [])
-    if tags:
+    if isinstance(tags, list) and tags:
         tag_str = " · ".join(f"`{t}`" for t in tags[:6])
         embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
 
-    links = []
+    links: list[str] = []
     if article.metadata.get("arxiv_url"):
         links.append(f"[arXiv]({article.metadata['arxiv_url']})")
     if article.metadata.get("pdf_url"):
@@ -1064,15 +1095,15 @@ def build_model_embed(article: Article, summary: dict) -> discord.Embed:
     if isinstance(specs, dict) and specs:
         spec_parts = []
         if specs.get("task"):
-            spec_parts.append(f"**Task:** {truncate(specs['task'], 80)}")
-        if specs.get("params") and specs["params"].lower() != "không rõ":
-            spec_parts.append(f"**Params:** {truncate(specs['params'], 50)}")
-        if specs.get("context") and specs["context"].lower() != "không rõ":
-            spec_parts.append(f"**Context:** {truncate(specs['context'], 50)}")
+            spec_parts.append(f"**Task:** {truncate(str(specs['task']), 80)}")
+        if specs.get("params") and str(specs["params"]).lower() != "không rõ":
+            spec_parts.append(f"**Params:** {truncate(str(specs['params']), 50)}")
+        if specs.get("context") and str(specs["context"]).lower() != "không rõ":
+            spec_parts.append(f"**Context:** {truncate(str(specs['context']), 50)}")
         if specs.get("license"):
-            spec_parts.append(f"**License:** {truncate(specs['license'], 50)}")
+            spec_parts.append(f"**License:** {truncate(str(specs['license']), 50)}")
         if specs.get("library"):
-            spec_parts.append(f"**Library:** {truncate(specs['library'], 50)}")
+            spec_parts.append(f"**Library:** {truncate(str(specs['library']), 50)}")
         if spec_parts:
             embed.add_field(
                 name="📋 THÔNG SỐ",
@@ -1082,12 +1113,12 @@ def build_model_embed(article: Article, summary: dict) -> discord.Embed:
 
     strengths = summary.get("strengths", [])
     if isinstance(strengths, list) and strengths:
-        value = "\n".join(f"✅ {truncate(s, 200)}" for s in strengths[:4])
+        value = "\n".join(f"✅ {truncate(str(s), 200)}" for s in strengths[:4])
         embed.add_field(name="ĐIỂM MẠNH", value=truncate(value, 900), inline=False)
 
     weaknesses = summary.get("weaknesses", [])
     if isinstance(weaknesses, list) and weaknesses:
-        value = "\n".join(f"⚠️ {truncate(w, 200)}" for w in weaknesses[:4])
+        value = "\n".join(f"⚠️ {truncate(str(w), 200)}" for w in weaknesses[:4])
         embed.add_field(name="HẠN CHẾ", value=truncate(value, 900), inline=False)
 
     use_cases = summary.get("use_cases", "")
@@ -1100,7 +1131,7 @@ def build_model_embed(article: Article, summary: dict) -> discord.Embed:
         embed.add_field(name="💻 CÁCH DÙNG", value=code_block, inline=False)
 
     tags = summary.get("tags", [])
-    if tags:
+    if isinstance(tags, list) and tags:
         tag_str = " · ".join(f"`{t}`" for t in tags[:6])
         embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
 
@@ -1319,7 +1350,10 @@ class DeniaBot(discord.Client):
                     if not new_articles:
                         continue
 
-                    logger.info(f"[Pipeline] Summarizing {len(new_articles)} new articles from {fetcher.name}")
+                    logger.info(
+                        f"[Pipeline] Summarizing {len(new_articles)} new articles "
+                        f"from {fetcher.name}"
+                    )
                     summarized = await summarize_articles(self.mistral, new_articles)
 
                     for article, summary in summarized:
@@ -1334,7 +1368,8 @@ class DeniaBot(discord.Client):
 
             stats = await self.db.get_stats()
             logger.info(
-                f"[Pipeline] Done. Sent {total_sent} this cycle. Total: {stats['total_sent']}"
+                f"[Pipeline] Done. Sent {total_sent} this cycle. "
+                f"Total: {stats['total_sent']}"
             )
             logger.info("=" * 60)
 
