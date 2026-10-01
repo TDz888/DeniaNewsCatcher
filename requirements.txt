@@ -6,3 +6,5 @@ feedparser==6.0.11
 mistralai>=2.0.0
 loguru==0.7.2
 python-dotenv==1.0.1
+beautifulsoup4==4.12.3
+tzdata==2024.1
