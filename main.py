@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import os
+import random
 import re
 import sys
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ import aiosqlite
 import discord
 import feedparser
 import httpx
+from aiolimiter import AsyncLimiter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -36,10 +38,11 @@ DB_PATH = os.getenv("DB_PATH", "/data/denia.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "100"))
 HN_MIN_COMMENTS = int(os.getenv("HN_MIN_COMMENTS", "20"))
-MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "8"))
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "90"))
-LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "5"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1500"))
+LLM_RATE_INTERVAL = float(os.getenv("LLM_RATE_INTERVAL", "1.2"))
 
 logger.remove()
 logger.add(
@@ -817,6 +820,21 @@ def get_prompt(category: str) -> str:
     return NEWS_PROMPT
 
 
+class LLMRateLimiter:
+    def __init__(self, min_interval: float = 1.2):
+        self._limiter = AsyncLimiter(1, min_interval)
+
+    async def __aenter__(self):
+        await self._limiter.acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+
+llm_limiter = LLMRateLimiter(min_interval=LLM_RATE_INTERVAL)
+
+
 async def summarize(client: Mistral, article: Article) -> dict | None:
     content = article.content[:7000]
     prompt_template = get_prompt(article.category)
@@ -847,17 +865,19 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
 
     for attempt in range(LLM_MAX_RETRIES):
         try:
-            async with asyncio.timeout(LLM_TIMEOUT):
-                resp = await client.chat.complete_async(
-                    model=LLM_MODEL,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.3,
-                    max_tokens=LLM_MAX_TOKENS,
-                )
+            async with llm_limiter:
+                async with asyncio.timeout(LLM_TIMEOUT):
+                    resp = await client.chat.complete_async(
+                        model=LLM_MODEL,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.3,
+                        max_tokens=LLM_MAX_TOKENS,
+                    )
+
             raw = resp.choices[0].message.content
             data = json.loads(raw)
 
@@ -870,6 +890,7 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
                 logger.warning(f"[LLM] TL;DR identical to title for '{article.title[:60]}'")
                 return None
 
+            logger.info(f"[LLM] OK: '{article.title[:50]}'")
             return data
 
         except json.JSONDecodeError as e:
@@ -877,28 +898,39 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
                 f"[LLM] Invalid JSON for '{article.title[:60]}' "
                 f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
             )
+            if attempt < LLM_MAX_RETRIES - 1:
+                wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                await asyncio.sleep(wait)
+
         except asyncio.TimeoutError:
             logger.warning(
                 f"[LLM] Timeout for '{article.title[:60]}' "
                 f"(attempt {attempt + 1}/{LLM_MAX_RETRIES})"
             )
+            if attempt < LLM_MAX_RETRIES - 1:
+                wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                await asyncio.sleep(wait)
+
         except Exception as e:
             error_str = str(e)
+
             if "429" in error_str or "rate" in error_str.lower():
-                wait = 5 * (attempt + 1)
+                wait = min(120, (2 ** attempt) + random.uniform(0, 1))
                 logger.warning(
-                    f"[LLM] Rate limited for '{article.title[:60]}', waiting {wait}s"
+                    f"[LLM] Rate limited for '{article.title[:60]}' "
+                    f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}), waiting {wait:.1f}s"
                 )
                 await asyncio.sleep(wait)
-                continue
-            logger.error(
-                f"[LLM] Summarize failed for '{article.title[:60]}' "
-                f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
-            )
+            else:
+                logger.error(
+                    f"[LLM] Failed for '{article.title[:60]}' "
+                    f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+                )
+                if attempt < LLM_MAX_RETRIES - 1:
+                    wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                    await asyncio.sleep(wait)
 
-        if attempt < LLM_MAX_RETRIES - 1:
-            await asyncio.sleep(2 ** attempt)
-
+    logger.error(f"[LLM] Gave up on '{article.title[:60]}' after {LLM_MAX_RETRIES} attempts")
     return None
 
 
@@ -918,7 +950,7 @@ async def filter_new(db: DatabaseManager, articles: list[Article]) -> list[Artic
 async def summarize_articles(
     client: Mistral, articles: list[Article]
 ) -> list[tuple[Article, dict]]:
-    semaphore = asyncio.Semaphore(2)
+    semaphore = asyncio.Semaphore(1)
 
     async def _one(art: Article):
         async with semaphore:
