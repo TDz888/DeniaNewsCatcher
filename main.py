@@ -15,7 +15,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from loguru import logger
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 load_dotenv()
 
@@ -33,6 +33,8 @@ DB_PATH = os.getenv("DB_PATH", "/data/denia.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "50"))
 MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "20"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
 logger.remove()
 logger.add(
@@ -67,6 +69,23 @@ CREATE INDEX IF NOT EXISTS idx_source ON seen_articles(source);
 """
 
 
+def validate_config() -> list[str]:
+    errors = []
+    if not DISCORD_TOKEN:
+        errors.append("DISCORD_TOKEN is required")
+    if not MISTRAL_API_KEY:
+        errors.append("MISTRAL_API_KEY is required")
+    if CHANNEL_NEWS_ID == 0:
+        errors.append("CHANNEL_NEWS_ID is required")
+    if CHANNEL_PAPERS_ID == 0:
+        errors.append("CHANNEL_PAPERS_ID is required")
+    if CHANNEL_MODELS_ID == 0:
+        errors.append("CHANNEL_MODELS_ID is required")
+    if CHANNEL_LOGS_ID == 0:
+        errors.append("CHANNEL_LOGS_ID is required")
+    return errors
+
+
 class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -78,6 +97,7 @@ class DatabaseManager:
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._conn.execute("PRAGMA synchronous=NORMAL;")
         await self._conn.execute("PRAGMA busy_timeout=5000;")
+        await self._conn.execute("PRAGMA cache_size=-64000;")
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
         logger.info(f"Database connected at {self.db_path}")
@@ -85,9 +105,12 @@ class DatabaseManager:
     async def close(self):
         if self._conn:
             await self._conn.close()
+            self._conn = None
             logger.info("Database connection closed")
 
     async def is_seen(self, source: str, external_id: str) -> bool:
+        if self._conn is None:
+            return False
         async with self._conn.execute(
             "SELECT 1 FROM seen_articles WHERE source = ? AND external_id = ? LIMIT 1",
             (source, external_id),
@@ -104,6 +127,8 @@ class DatabaseManager:
         channel_id: int,
         message_id: int,
     ) -> None:
+        if self._conn is None:
+            return
         await self._conn.execute(
             """
             INSERT OR IGNORE INTO seen_articles
@@ -122,6 +147,8 @@ class DatabaseManager:
         title: str,
         error: str,
     ) -> None:
+        if self._conn is None:
+            return
         await self._conn.execute(
             """
             INSERT OR IGNORE INTO seen_articles
@@ -133,6 +160,8 @@ class DatabaseManager:
         await self._conn.commit()
 
     async def get_stats(self) -> dict:
+        if self._conn is None:
+            return {"total_sent": 0, "by_source": {}}
         async with self._conn.execute(
             "SELECT COUNT(*) FROM seen_articles WHERE status='sent'"
         ) as cur:
@@ -511,33 +540,57 @@ def get_prompt(category: str) -> str:
     return NEWS_PROMPT
 
 
-async def summarize(client: Mistral, title: str, content: str, category: str) -> dict | None:
+async def summarize(
+    client: Mistral, title: str, content: str, category: str
+) -> dict | None:
     content = content[:6000]
     prompt = get_prompt(category).format(title=title, content=content)
 
-    try:
-        resp = await client.chat.complete_async(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=800,
-        )
-        raw = resp.choices[0].message.content
-        data = json.loads(raw)
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"[LLM] Invalid JSON for '{title[:60]}': {e}")
-        return None
-    except KeyError as e:
-        logger.error(f"[LLM] Missing key in response for '{title[:60]}': {e}")
-        return None
-    except Exception as e:
-        logger.error(f"[LLM] Summarize failed for '{title[:60]}': {e}")
-        return None
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            async with asyncio.timeout(LLM_TIMEOUT):
+                resp = await client.chat.complete_async(
+                    model=LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.3,
+                    max_tokens=800,
+                )
+            raw = resp.choices[0].message.content
+            data = json.loads(raw)
+            return data
+
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"[LLM] Invalid JSON for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+            )
+            if attempt == LLM_MAX_RETRIES - 1:
+                return None
+        except KeyError as e:
+            logger.warning(
+                f"[LLM] Missing key in response for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+            )
+            if attempt == LLM_MAX_RETRIES - 1:
+                return None
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[LLM] Timeout for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES})"
+            )
+            if attempt == LLM_MAX_RETRIES - 1:
+                return None
+        except Exception as e:
+            logger.error(
+                f"[LLM] Summarize failed for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+            )
+            if attempt == LLM_MAX_RETRIES - 1:
+                return None
+
+        await asyncio.sleep(2 ** attempt)
+
+    return None
 
 
 async def filter_new(db: DatabaseManager, articles: list[Article]) -> list[Article]:
@@ -663,10 +716,14 @@ def get_channel_id(category: str) -> int:
 
 
 async def send_log(bot: discord.Client, message: str):
+    if not CHANNEL_LOGS_ID:
+        return
     try:
         channel = bot.get_channel(CHANNEL_LOGS_ID)
+        if channel is None:
+            channel = await bot.fetch_channel(CHANNEL_LOGS_ID)
         if channel:
-            await channel.send(f"```{message}```")
+            await channel.send(f"```{message[:1900]}```")
     except Exception as e:
         logger.error(f"[Log] Failed to send log: {e}")
 
@@ -687,7 +744,9 @@ async def push_article(
         except Exception as e:
             logger.error(f"[Push] Channel {channel_id} not found: {e}")
             await send_log(bot, f"[Push] Channel {channel_id} not found: {e}")
-            await db.mark_failed(article.source, article.external_id, article.url, article.title, "channel not found")
+            await db.mark_failed(
+                article.source, article.external_id, article.url, article.title, "channel not found"
+            )
             return
 
     lock = locks.get(channel_id)
@@ -708,10 +767,29 @@ async def push_article(
                 msg.id,
             )
             await asyncio.sleep(1.2)
+
+        except discord.Forbidden:
+            error_msg = "Bot lacks permission to send messages in this channel"
+            logger.error(f"[Push] {error_msg} ({channel_id})")
+            await send_log(bot, f"[Push] {error_msg}")
+            await db.mark_failed(
+                article.source, article.external_id, article.url, article.title, error_msg
+            )
+
+        except discord.NotFound:
+            error_msg = "Channel not found or deleted"
+            logger.error(f"[Push] {error_msg} ({channel_id})")
+            await send_log(bot, f"[Push] {error_msg}")
+            await db.mark_failed(
+                article.source, article.external_id, article.url, article.title, error_msg
+            )
+
         except Exception as e:
             logger.error(f"[Push] Failed to send {article.title[:60]}: {e}")
             await send_log(bot, f"[Push] Failed to send {article.title[:60]}: {e}")
-            await db.mark_failed(article.source, article.external_id, article.url, article.title, str(e))
+            await db.mark_failed(
+                article.source, article.external_id, article.url, article.title, str(e)
+            )
 
 
 class DeniaBot(discord.Client):
@@ -762,10 +840,13 @@ class DeniaBot(discord.Client):
         asyncio.create_task(self.run_pipeline())
 
     async def on_disconnect(self):
-        if self.db:
-            await self.db.close()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         if self.mistral:
             await self.mistral.close()
+            self.mistral = None
+        if self.db:
+            await self.db.close()
         logger.info("DeniaNewsCatcher disconnected")
 
     async def run_pipeline(self):
@@ -791,7 +872,9 @@ class DeniaBot(discord.Client):
                     summarized = await summarize_articles(self.mistral, new_articles)
 
                     for article, summary in summarized:
-                        await push_article(self, self.db, article, summary, self.channel_locks)
+                        await push_article(
+                            self, self.db, article, summary, self.channel_locks
+                        )
                         total_sent += 1
 
                 except Exception as e:
@@ -799,15 +882,27 @@ class DeniaBot(discord.Client):
                     await send_log(self, f"[Pipeline] Fetcher {fetcher.name} error: {e}")
 
             stats = await self.db.get_stats()
-            logger.info(f"[Pipeline] Done. Sent {total_sent} this cycle. Total: {stats['total_sent']}")
+            logger.info(
+                f"[Pipeline] Done. Sent {total_sent} this cycle. Total: {stats['total_sent']}"
+            )
 
 
 def main():
+    errors = validate_config()
+    if errors:
+        logger.error("Configuration errors:")
+        for err in errors:
+            logger.error(f"  - {err}")
+        sys.exit(1)
+
     bot = DeniaBot()
     try:
         bot.run(DISCORD_TOKEN, log_handler=None)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+    except Exception as e:
+        logger.exception(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
