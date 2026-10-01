@@ -15,7 +15,6 @@ import aiosqlite
 import discord
 import feedparser
 import httpx
-from aiolimiter import AsyncLimiter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -822,10 +821,17 @@ def get_prompt(category: str) -> str:
 
 class LLMRateLimiter:
     def __init__(self, min_interval: float = 1.2):
-        self._limiter = AsyncLimiter(1, min_interval)
+        self.min_interval = min_interval
+        self._last_call = 0.0
+        self._lock = asyncio.Lock()
 
     async def __aenter__(self):
-        await self._limiter.acquire()
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self._last_call + self.min_interval - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = asyncio.get_event_loop().time()
         return self
 
     async def __aexit__(self, *args):
