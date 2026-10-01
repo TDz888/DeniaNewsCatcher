@@ -1,17 +1,20 @@
 import asyncio
+import html
 import json
 import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import aiosqlite
 import discord
 import feedparser
 import httpx
+import trafilatura
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from loguru import logger
@@ -31,10 +34,12 @@ LLM_MODEL = os.getenv("LLM_MODEL", "mistral-small-latest")
 DB_PATH = os.getenv("DB_PATH", "/data/denia.db")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "50"))
-MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "20"))
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "100"))
+HN_MIN_COMMENTS = int(os.getenv("HN_MIN_COMMENTS", "20"))
+MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "8"))
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "90"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1500"))
 
 logger.remove()
 logger.add(
@@ -49,11 +54,17 @@ logger.add(
     colorize=True,
 )
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS seen_articles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,
     external_id TEXT NOT NULL,
+    canonical_url TEXT,
     url TEXT NOT NULL,
     title TEXT,
     channel_id INTEGER,
@@ -64,13 +75,49 @@ CREATE TABLE IF NOT EXISTS seen_articles (
     UNIQUE(source, external_id)
 );
 
+CREATE TABLE IF NOT EXISTS seen_urls (
+    canonical_url TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_created ON seen_articles(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_source ON seen_articles(source);
+CREATE INDEX IF NOT EXISTS idx_canonical ON seen_articles(canonical_url);
 """
 
 
+def canonicalize_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    query = parse_qs(parsed.query)
+    tracking = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source", "_hs")
+    for key in list(query.keys()):
+        lk = key.lower()
+        if any(lk.startswith(t) for t in tracking):
+            del query[key]
+    new_query = urlencode(query, doseq=True)
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme.lower(), netloc, path, "", new_query, ""))
+
+
+def truncate(text: str, max_len: int) -> str:
+    if not text:
+        return ""
+    text = str(text).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
 def validate_config() -> list[str]:
-    errors = []
+    errors: list[str] = []
     if not DISCORD_TOKEN:
         errors.append("DISCORD_TOKEN is required")
     if not MISTRAL_API_KEY:
@@ -108,20 +155,29 @@ class DatabaseManager:
             self._conn = None
             logger.info("Database connection closed")
 
-    async def is_seen(self, source: str, external_id: str) -> bool:
+    async def is_seen(self, source: str, external_id: str, canonical_url: str) -> bool:
         if self._conn is None:
             return False
         async with self._conn.execute(
             "SELECT 1 FROM seen_articles WHERE source = ? AND external_id = ? LIMIT 1",
             (source, external_id),
         ) as cursor:
-            row = await cursor.fetchone()
-            return row is not None
+            if await cursor.fetchone():
+                return True
+        if canonical_url:
+            async with self._conn.execute(
+                "SELECT 1 FROM seen_urls WHERE canonical_url = ? LIMIT 1",
+                (canonical_url,),
+            ) as cursor:
+                if await cursor.fetchone():
+                    return True
+        return False
 
     async def mark_sent(
         self,
         source: str,
         external_id: str,
+        canonical_url: str,
         url: str,
         title: str,
         channel_id: int,
@@ -132,17 +188,23 @@ class DatabaseManager:
         await self._conn.execute(
             """
             INSERT OR IGNORE INTO seen_articles
-            (source, external_id, url, title, channel_id, message_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'sent')
+            (source, external_id, canonical_url, url, title, channel_id, message_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'sent')
             """,
-            (source, external_id, url, title, channel_id, message_id),
+            (source, external_id, canonical_url, url, title, channel_id, message_id),
         )
+        if canonical_url:
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO seen_urls (canonical_url) VALUES (?)",
+                (canonical_url,),
+            )
         await self._conn.commit()
 
     async def mark_failed(
         self,
         source: str,
         external_id: str,
+        canonical_url: str,
         url: str,
         title: str,
         error: str,
@@ -152,10 +214,10 @@ class DatabaseManager:
         await self._conn.execute(
             """
             INSERT OR IGNORE INTO seen_articles
-            (source, external_id, url, title, status, error)
-            VALUES (?, ?, ?, ?, 'failed', ?)
+            (source, external_id, canonical_url, url, title, status, error)
+            VALUES (?, ?, ?, ?, ?, 'failed', ?)
             """,
-            (source, external_id, url, title, error[:500]),
+            (source, external_id, canonical_url, url, title, error[:500]),
         )
         await self._conn.commit()
 
@@ -184,6 +246,11 @@ class Article:
     published_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     category: str = "news"
+    comments: list[str] = field(default_factory=list)
+
+    @property
+    def canonical_url(self) -> str:
+        return canonicalize_url(self.url)
 
 
 class BaseFetcher:
@@ -196,10 +263,86 @@ class BaseFetcher:
 
 AI_KEYWORDS = [
     "ai", "llm", "gpt", "machine learning", "deep learning",
-    "neural", "transformer", "model", "dataset", "benchmark",
-    "openai", "anthropic", "google ai", "meta ai", "huggingface",
-    "pytorch", "tensorflow", "diffusion", "rag", "agent",
+    "neural", "transformer", "diffusion", "rag", "agent",
+    "openai", "anthropic", "mistral", "huggingface", "pytorch",
+    "tensorflow", "gemini", "claude", "llama", "langchain",
+    "embedding", "fine-tuning", "inference", "generative",
+    "chatbot", "prompt", "reasoning", "multimodal",
 ]
+
+
+def is_ai_related(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    for kw in AI_KEYWORDS:
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, lowered):
+            return True
+    return False
+
+
+async def extract_article_content(url: str) -> str | None:
+    if not url:
+        return None
+    try:
+        async with httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            raw_html = resp.text
+    except Exception as e:
+        logger.debug(f"[Extract] HTTP failed for {url[:80]}: {e}")
+        return None
+
+    try:
+        text = trafilatura.extract(
+            raw_html,
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,
+        )
+        if text and len(text.strip()) > 100:
+            return text.strip()
+    except Exception as e:
+        logger.debug(f"[Extract] Parse failed for {url[:80]}: {e}")
+    return None
+
+
+async def fetch_hn_comments(story_id: str, max_comments: int = 6) -> list[str]:
+    url = f"https://hn.algolia.com/api/v1/items/{story_id}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.debug(f"[HN Comments] Fetch failed for {story_id}: {e}")
+        return []
+
+    comments: list[str] = []
+
+    def walk(node: dict, depth: int = 0) -> None:
+        if depth > 3 or len(comments) >= max_comments:
+            return
+        for child in node.get("children", []) or []:
+            if len(comments) >= max_comments:
+                return
+            text = child.get("text")
+            if text:
+                clean = re.sub(r"<[^>]+>", "", text)
+                clean = html.unescape(clean).strip()
+                clean = re.sub(r"\s+", " ", clean)
+                if len(clean) > 80:
+                    comments.append(truncate(clean, 400))
+            walk(child, depth + 1)
+
+    walk(data)
+    return comments[:max_comments]
 
 
 class HackerNewsFetcher(BaseFetcher):
@@ -211,7 +354,7 @@ class HackerNewsFetcher(BaseFetcher):
         params = {
             "tags": "story",
             "numericFilters": f"points>{HN_MIN_SCORE}",
-            "hitsPerPage": MAX_ARTICLES_PER_SOURCE,
+            "hitsPerPage": MAX_ARTICLES_PER_SOURCE * 3,
         }
 
         try:
@@ -225,13 +368,41 @@ class HackerNewsFetcher(BaseFetcher):
 
         articles: list[Article] = []
         for hit in data.get("hits", []):
-            title = hit.get("title") or ""
-            url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit['objectID']}"
-            text = (hit.get("story_text") or "").strip()
+            if len(articles) >= MAX_ARTICLES_PER_SOURCE:
+                break
 
-            haystack = f"{title} {text}".lower()
-            if not any(kw in haystack for kw in AI_KEYWORDS):
+            title = hit.get("title") or ""
+            external_url = hit.get("url")
+            story_text = (hit.get("story_text") or "").strip()
+            hn_url = f"https://news.ycombinator.com/item?id={hit['objectID']}"
+            url = external_url or hn_url
+
+            if not is_ai_related(f"{title} {story_text}"):
                 continue
+
+            content = ""
+            if external_url:
+                content = await extract_article_content(external_url) or ""
+
+            if not content and story_text:
+                content = story_text
+
+            comments: list[str] = []
+            num_comments = hit.get("num_comments", 0)
+            if num_comments >= HN_MIN_COMMENTS:
+                comments = await fetch_hn_comments(hit["objectID"])
+
+            if not content and comments:
+                content = "Bài viết là link ngoài không truy cập được. Dưới đây là thảo luận cộng đồng:\n\n" + "\n\n".join(comments)
+
+            if len(content) < 150:
+                logger.debug(f"[HN] Skip '{title[:60]}' - content too short ({len(content)} chars)")
+                continue
+
+            try:
+                published = datetime.fromisoformat(hit["created_at"].replace("Z", "+00:00"))
+            except Exception:
+                published = None
 
             articles.append(
                 Article(
@@ -239,19 +410,21 @@ class HackerNewsFetcher(BaseFetcher):
                     external_id=hit["objectID"],
                     url=url,
                     title=title,
-                    content=text or title,
+                    content=content[:8000],
                     author=hit.get("author"),
-                    published_at=datetime.fromisoformat(
-                        hit["created_at"].replace("Z", "+00:00")
-                    ),
+                    published_at=published,
                     metadata={
                         "points": hit.get("points", 0),
-                        "comments": hit.get("num_comments", 0),
-                        "hn_url": f"https://news.ycombinator.com/item?id={hit['objectID']}",
+                        "comments": num_comments,
+                        "hn_url": hn_url,
+                        "external_url": external_url,
                     },
                     category=self.category,
+                    comments=comments,
                 )
             )
+
+            await asyncio.sleep(0.3)
 
         logger.info(f"[HN] Fetched {len(articles)} AI articles")
         return articles
@@ -273,13 +446,16 @@ class HuggingFacePapersFetcher(BaseFetcher):
             return []
 
         articles: list[Article] = []
-        for item in data[:MAX_ARTICLES_PER_SOURCE]:
+        for item in data[: MAX_ARTICLES_PER_SOURCE * 2]:
+            if len(articles) >= MAX_ARTICLES_PER_SOURCE:
+                break
+
             paper = item.get("paper", {})
             arxiv_id = paper.get("id", "")
-            title = paper.get("title", "").strip()
-            summary = paper.get("summary", "").strip()
+            title = (paper.get("title") or "").strip()
+            summary = (paper.get("summary") or "").strip()
 
-            if not title or not summary:
+            if not title or not summary or len(summary) < 200:
                 continue
 
             published = None
@@ -291,6 +467,8 @@ class HuggingFacePapersFetcher(BaseFetcher):
                 except Exception:
                     published = None
 
+            authors = ", ".join(a.get("name", "") for a in paper.get("authors", [])[:3])
+
             articles.append(
                 Article(
                     source=self.name,
@@ -298,12 +476,13 @@ class HuggingFacePapersFetcher(BaseFetcher):
                     url=f"https://huggingface.co/papers/{arxiv_id}",
                     title=title,
                     content=summary,
-                    author=", ".join(a.get("name", "") for a in paper.get("authors", [])[:3]),
+                    author=authors,
                     published_at=published,
                     metadata={
                         "upvotes": paper.get("upvotes", 0),
                         "arxiv_id": arxiv_id,
                         "hf_url": f"https://huggingface.co/papers/{arxiv_id}",
+                        "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
                     },
                     category=self.category,
                 )
@@ -341,26 +520,27 @@ class HuggingFaceModelsFetcher(BaseFetcher):
                 continue
 
             created = m.get("createdAt")
+            dt = None
             if created:
                 try:
                     dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
                 except Exception:
                     dt = None
-            else:
-                dt = None
 
             tags = m.get("tags", [])
             pipeline = m.get("pipeline_tag", "unknown")
             downloads = m.get("downloads", 0)
             likes = m.get("likes", 0)
+            library = m.get("library_name", "unknown")
 
             content = (
-                f"Model: {model_id}\n"
+                f"Model ID: {model_id}\n"
+                f"Author: {m.get('author', 'unknown')}\n"
                 f"Task: {pipeline}\n"
-                f"Tags: {', '.join(tags[:10])}\n"
+                f"Library: {library}\n"
                 f"Downloads: {downloads}\n"
                 f"Likes: {likes}\n"
-                f"Library: {m.get('library_name', 'unknown')}"
+                f"Tags: {', '.join(tags[:15])}"
             )
 
             articles.append(
@@ -377,6 +557,8 @@ class HuggingFaceModelsFetcher(BaseFetcher):
                         "downloads": downloads,
                         "likes": likes,
                         "tags": tags[:10],
+                        "library": library,
+                        "model_id": model_id,
                     },
                     category=self.category,
                 )
@@ -416,10 +598,15 @@ class ArxivFetcher(BaseFetcher):
             title = entry.title.strip().replace("\n", " ")
             summary = entry.summary.strip().replace("\n", " ")
 
+            if len(summary) < 200:
+                continue
+
             try:
                 published = datetime.fromisoformat(entry.published.replace("Z", "+00:00"))
             except Exception:
                 published = None
+
+            authors = ", ".join(a.name for a in entry.get("authors", [])[:3])
 
             articles.append(
                 Article(
@@ -428,9 +615,13 @@ class ArxivFetcher(BaseFetcher):
                     url=entry.id,
                     title=title,
                     content=summary,
-                    author=", ".join(a.name for a in entry.get("authors", [])[:3]),
+                    author=authors,
                     published_at=published,
-                    metadata={"arxiv_id": arxiv_id},
+                    metadata={
+                        "arxiv_id": arxiv_id,
+                        "arxiv_url": entry.id,
+                        "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+                    },
                     category=self.category,
                 )
             )
@@ -447,7 +638,7 @@ class RSSFetcher(BaseFetcher):
 
     async def fetch(self) -> list[Article]:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, headers={"User-Agent": USER_AGENT}) as client:
                 resp = await client.get(self.rss_url)
                 resp.raise_for_status()
                 feed = feedparser.parse(resp.text)
@@ -456,18 +647,31 @@ class RSSFetcher(BaseFetcher):
             return []
 
         articles: list[Article] = []
-        for entry in feed.entries[:15]:
-            title = entry.get("title", "").strip()
+        for entry in feed.entries[: MAX_ARTICLES_PER_SOURCE * 2]:
+            if len(articles) >= MAX_ARTICLES_PER_SOURCE:
+                break
+
+            title = (entry.get("title") or "").strip()
             url = entry.get("link", "")
             summary = entry.get("summary", "") or entry.get("description", "")
-
-            summary = re.sub(r"<[^>]+>", "", summary).strip()
+            summary = re.sub(r"<[^>]+>", "", summary)
+            summary = html.unescape(summary).strip()
 
             if not title or not url:
                 continue
 
+            if len(summary) < 200:
+                extracted = await extract_article_content(url)
+                if extracted:
+                    summary = extracted
+
+            if len(summary) < 150:
+                continue
+
+            published = None
             try:
-                published = datetime(*entry.published_parsed[:6]) if entry.get("published_parsed") else None
+                if entry.get("published_parsed"):
+                    published = datetime(*entry.published_parsed[:6])
             except Exception:
                 published = None
 
@@ -477,7 +681,7 @@ class RSSFetcher(BaseFetcher):
                     external_id=entry.get("id", url),
                     url=url,
                     title=title,
-                    content=summary or title,
+                    content=summary[:8000],
                     published_at=published,
                     category=self.category,
                 )
@@ -487,49 +691,87 @@ class RSSFetcher(BaseFetcher):
         return articles
 
 
-SYSTEM_PROMPT = """Bạn là DeniaNewsCatcher - chuyên gia AI tóm tắt tin tức, paper, và model.
-Nhiệm vụ: tóm tắt nội dung bằng tiếng Việt, CHỈ dùng thông tin từ nội dung gốc.
-Nếu không có thông tin, ghi "không rõ". KHÔNG bịa. Trả về JSON hợp lệ, không thêm text ngoài JSON."""
+SYSTEM_PROMPT = """Bạn là DeniaNewsCatcher - một chuyên gia phân tích AI, đọc hiểu tin tức, paper, và model với trình độ cao.
 
-PAPER_PROMPT = """Tóm tắt paper AI sau, trả về JSON:
+QUY TẮC BẮT BUỘC:
+1. CHỈ dùng thông tin có trong nội dung được cung cấp. KHÔNG bịa, KHÔNG thêm kiến thức ngoài.
+2. TL;DR PHẢI KHÁC với tiêu đề. Không được lặp lại tiêu đề. Phải chứa thông tin cụ thể: con số, tên riêng, sự kiện.
+3. Mọi điểm chính phải có thông tin cụ thể, không được chung chung kiểu "công ty đang phát triển AI".
+4. Nếu một phần không có thông tin, ghi rõ "Không có thông tin trong bài".
+5. Trả về DUY NHẤT một JSON object hợp lệ, không có text nào khác ngoài JSON.
+6. Tất cả nội dung bằng tiếng Việt, giữ nguyên tên riêng, tên model, tên công ty bằng tiếng Anh."""
+
+NEWS_PROMPT = """Phân tích bài tin tức AI sau và trả về JSON theo schema:
 
 {{
-  "tldr": "2-3 câu tóm tắt cốt lõi",
-  "problem": "Vấn đề paper giải quyết",
-  "method": "Phương pháp chính (ngắn gọn)",
-  "results": "Kết quả nổi bật, có số liệu nếu có",
-  "why_matters": "Vì sao đáng quan tâm",
+  "tldr": "3-4 câu tóm tắt cốt lõi. Phải có thông tin cụ thể: ai, làm gì, kết quả ra sao, con số nếu có. KHÔNG được lặp lại tiêu đề.",
+  "key_points": [
+    "Điểm chính 1 với thông tin cụ thể (tên, số liệu, hành động)",
+    "Điểm chính 2",
+    "Điểm chính 3",
+    "Điểm chính 4 nếu có"
+  ],
+  "context": "2-3 câu về bối cảnh: tại sao sự việc này xảy ra, có liên quan gì đến xu hướng AI hiện tại.",
+  "impact": "2-3 câu về tác động: ai bị ảnh hưởng (công ty, developer, người dùng), lĩnh vực nào.",
+  "tags": ["tag1", "tag2", "tag3", "tag4"]
+}}
+
+Tiêu đề: {title}
+Nguồn: {source}
+Nội dung bài viết:
+{content}
+
+{comments_section}"""
+
+PAPER_PROMPT = """Phân tích paper AI sau và trả về JSON theo schema:
+
+{{
+  "tldr": "3-4 câu tóm tắt toàn bộ paper. Nêu rõ: giải quyết vấn đề gì, dùng phương pháp gì, đạt kết quả ra sao. Có số liệu cụ thể.",
+  "problem": "2-3 câu mô tả vấn đề paper giải quyết. Tại sao vấn đề này khó? Cách tiếp cận hiện tại có hạn chế gì?",
+  "method": "3-4 câu về phương pháp chính. Kiến trúc, thuật toán, dataset sử dụng, cách huấn luyện nếu có.",
+  "results": [
+    "Kết quả cụ thể 1: tên benchmark + số liệu (accuracy, F1, BLEU...) + so với baseline nào",
+    "Kết quả cụ thể 2",
+    "Kết quả cụ thể 3"
+  ],
+  "limitations": "2 câu về hạn chế của phương pháp. Paper có đề cập hoặc có thể suy ra từ kết quả.",
+  "applications": "2 câu về ứng dụng thực tế của nghiên cứu này.",
   "tags": ["tag1", "tag2", "tag3"]
 }}
 
 Tiêu đề: {title}
-Nội dung: {content}"""
+Tác giả: {author}
+Nội dung (abstract):
+{content}"""
 
-MODEL_PROMPT = """Tóm tắt model HuggingFace sau, trả về JSON:
-
-{{
-  "tldr": "2-3 câu giới thiệu model",
-  "task": "Task chính",
-  "strengths": ["điểm mạnh 1", "điểm mạnh 2"],
-  "weaknesses": ["điểm yếu nếu có"],
-  "use_case": "Dùng khi nào",
-  "tags": ["tag1", "tag2"]
-}}
-
-Tên model: {title}
-Thông tin: {content}"""
-
-NEWS_PROMPT = """Tóm tắt tin tức AI sau, trả về JSON:
+MODEL_PROMPT = """Phân tích model AI sau và trả về JSON theo schema:
 
 {{
-  "tldr": "1-2 câu tóm tắt",
-  "key_points": ["điểm 1", "điểm 2", "điểm 3"],
-  "why_matters": "Vì sao quan trọng",
-  "tags": ["tag1", "tag2"]
+  "tldr": "3-4 câu giới thiệu model. Model làm được gì, được huấn luyện thế nào, khác biệt gì so với model khác.",
+  "introduction": "2-3 câu về model này: do ai phát triển, mục đích, điểm đặc biệt.",
+  "specs": {{
+    "task": "Task chính của model",
+    "library": "Thư viện sử dụng",
+    "license": "Giấy phép nếu có",
+    "params": "Số tham số nếu biết, nếu không ghi 'không rõ'",
+    "context": "Context length nếu có, nếu không ghi 'không rõ'"
+  }},
+  "strengths": [
+    "Điểm mạnh cụ thể 1",
+    "Điểm mạnh cụ thể 2"
+  ],
+  "weaknesses": [
+    "Hạn chế 1",
+    "Hạn chế 2"
+  ],
+  "use_cases": "2 câu về khi nào nên dùng model này, ứng dụng phù hợp.",
+  "code_snippet": "3-5 dòng code Python để load model bằng transformers hoặc thư viện tương ứng.",
+  "tags": ["tag1", "tag2", "tag3"]
 }}
 
-Tiêu đề: {title}
-Nội dung: {content}"""
+Model ID: {title}
+Thông tin model:
+{content}"""
 
 
 def get_prompt(category: str) -> str:
@@ -541,10 +783,36 @@ def get_prompt(category: str) -> str:
 
 
 async def summarize(
-    client: Mistral, title: str, content: str, category: str
+    client: Mistral, article: Article
 ) -> dict | None:
-    content = content[:6000]
-    prompt = get_prompt(category).format(title=title, content=content)
+    content = article.content[:7000]
+    prompt_template = get_prompt(article.category)
+
+    if article.category == "news":
+        if article.comments:
+            comments_text = "\n\n".join(f"- {c}" for c in article.comments[:5])
+            comments_section = (
+                "Thảo luận cộng đồng (từ Hacker News):\n" + comments_text
+            )
+        else:
+            comments_section = ""
+        prompt = prompt_template.format(
+            title=article.title,
+            source=article.source,
+            content=content,
+            comments_section=comments_section,
+        )
+    elif article.category == "papers":
+        prompt = prompt_template.format(
+            title=article.title,
+            author=article.author or "không rõ",
+            content=content,
+        )
+    else:
+        prompt = prompt_template.format(
+            title=article.title,
+            content=content,
+        )
 
     for attempt in range(LLM_MAX_RETRIES):
         try:
@@ -557,38 +825,48 @@ async def summarize(
                     ],
                     response_format={"type": "json_object"},
                     temperature=0.3,
-                    max_tokens=800,
+                    max_tokens=LLM_MAX_TOKENS,
                 )
             raw = resp.choices[0].message.content
             data = json.loads(raw)
+
+            if not isinstance(data, dict):
+                logger.warning(f"[LLM] Response is not dict for '{article.title[:60]}'")
+                return None
+
+            tldr = data.get("tldr", "")
+            if not tldr or tldr.strip().lower() == article.title.strip().lower():
+                logger.warning(f"[LLM] TL;DR identical to title for '{article.title[:60]}'")
+                return None
+
             return data
 
         except json.JSONDecodeError as e:
             logger.warning(
-                f"[LLM] Invalid JSON for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+                f"[LLM] Invalid JSON for '{article.title[:60]}' "
+                f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
             )
-            if attempt == LLM_MAX_RETRIES - 1:
-                return None
-        except KeyError as e:
-            logger.warning(
-                f"[LLM] Missing key in response for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
-            )
-            if attempt == LLM_MAX_RETRIES - 1:
-                return None
         except asyncio.TimeoutError:
             logger.warning(
-                f"[LLM] Timeout for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES})"
+                f"[LLM] Timeout for '{article.title[:60]}' "
+                f"(attempt {attempt + 1}/{LLM_MAX_RETRIES})"
             )
-            if attempt == LLM_MAX_RETRIES - 1:
-                return None
         except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "rate" in error_str.lower():
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    f"[LLM] Rate limited for '{article.title[:60]}', waiting {wait}s"
+                )
+                await asyncio.sleep(wait)
+                continue
             logger.error(
-                f"[LLM] Summarize failed for '{title[:60]}' (attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
+                f"[LLM] Summarize failed for '{article.title[:60]}' "
+                f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
             )
-            if attempt == LLM_MAX_RETRIES - 1:
-                return None
 
-        await asyncio.sleep(2 ** attempt)
+        if attempt < LLM_MAX_RETRIES - 1:
+            await asyncio.sleep(2 ** attempt)
 
     return None
 
@@ -596,7 +874,7 @@ async def summarize(
 async def filter_new(db: DatabaseManager, articles: list[Article]) -> list[Article]:
     new_articles: list[Article] = []
     for art in articles:
-        if await db.is_seen(art.source, art.external_id):
+        if await db.is_seen(art.source, art.external_id, art.canonical_url):
             continue
         new_articles.append(art)
 
@@ -609,22 +887,28 @@ async def filter_new(db: DatabaseManager, articles: list[Article]) -> list[Artic
 async def summarize_articles(
     client: Mistral, articles: list[Article]
 ) -> list[tuple[Article, dict]]:
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(2)
 
     async def _one(art: Article):
         async with semaphore:
-            if len(art.content) < 100:
-                return art, {
-                    "tldr": art.title,
-                    "key_points": [],
-                    "why_matters": "",
-                    "tags": [],
-                }
-            summary = await summarize(client, art.title, art.content, art.category)
-            return art, summary
+            summary = await summarize(client, art)
+            if summary is None:
+                return None
+            return (art, summary)
 
-    results = await asyncio.gather(*[_one(a) for a in articles])
-    valid = [(a, s) for a, s in results if s is not None]
+    results = await asyncio.gather(
+        *[_one(a) for a in articles], return_exceptions=True
+    )
+
+    valid: list[tuple[Article, dict]] = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error(f"[Summarize] Task exception: {r}")
+            continue
+        if r is None:
+            continue
+        valid.append(r)
+
     logger.info(f"[Summarize] Summarized {len(valid)}/{len(articles)} articles")
     return valid
 
@@ -637,74 +921,207 @@ CATEGORY_COLORS = {
 
 SOURCE_ICONS = {
     "hackernews": "🟠 Hacker News",
-    "hf_papers": "🤗 HF Papers",
-    "hf_models": "🤗 HF Models",
+    "hf_papers": "🤗 HuggingFace Papers",
+    "hf_models": "🤗 HuggingFace Models",
     "arxiv": "📄 arXiv",
     "mit_tech": "📰 MIT Tech Review",
     "techcrunch": "📰 TechCrunch",
 }
 
 
-def build_embed(article: Article, summary: dict) -> discord.Embed:
+def build_news_embed(article: Article, summary: dict) -> discord.Embed:
+    color = CATEGORY_COLORS["news"]
     icon = SOURCE_ICONS.get(article.source, article.source)
-    color = CATEGORY_COLORS.get(article.category, 0x95A5A6)
 
     embed = discord.Embed(
-        title=article.title[:250],
+        title=truncate(article.title, 250),
         url=article.url,
         color=color,
     )
 
     tldr = summary.get("tldr", "")
     if tldr:
-        embed.description = f"**TL;DR:** {tldr[:400]}"
+        embed.description = f"**📌 TÓM TẮT**\n{truncate(tldr, 800)}"
 
-    if article.category == "papers":
-        if summary.get("problem"):
-            embed.add_field(name="🎯 Vấn đề", value=summary["problem"][:1000], inline=False)
-        if summary.get("method"):
-            embed.add_field(name="🔬 Phương pháp", value=summary["method"][:1000], inline=False)
-        if summary.get("results"):
-            embed.add_field(name="📊 Kết quả", value=summary["results"][:1000], inline=False)
-        if summary.get("why_matters"):
-            embed.add_field(name="⭐ Vì sao quan trọng", value=summary["why_matters"][:1000], inline=False)
+    key_points = summary.get("key_points", [])
+    if key_points:
+        value = "\n".join(f"• {truncate(p, 200)}" for p in key_points[:5])
+        embed.add_field(name="🔑 ĐIỂM CHÍNH", value=truncate(value, 1000), inline=False)
 
-    elif article.category == "models":
-        if summary.get("task"):
-            embed.add_field(name="📋 Task", value=summary["task"][:200], inline=True)
-        if summary.get("strengths"):
-            val = "\n".join(f"• {s}" for s in summary["strengths"][:4])
-            embed.add_field(name="✅ Điểm mạnh", value=val[:1000], inline=False)
-        if summary.get("weaknesses"):
-            val = "\n".join(f"• {s}" for s in summary["weaknesses"][:4])
-            embed.add_field(name="⚠️ Điểm yếu", value=val[:1000], inline=False)
+    context = summary.get("context", "")
+    if context and context.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="💡 BỐI CẢNH", value=truncate(context, 900), inline=False)
 
-    else:
-        points = summary.get("key_points", [])
-        if points:
-            val = "\n".join(f"• {p}" for p in points[:5])
-            embed.add_field(name="📌 Điểm chính", value=val[:1000], inline=False)
-        if summary.get("why_matters"):
-            embed.add_field(name="⭐ Vì sao quan trọng", value=summary["why_matters"][:1000], inline=False)
+    impact = summary.get("impact", "")
+    if impact and impact.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="🎯 TÁC ĐỘNG", value=truncate(impact, 900), inline=False)
+
+    if article.comments:
+        comment_text = "\n".join(f"• {truncate(c, 180)}" for c in article.comments[:4])
+        embed.add_field(
+            name=f"💬 THẢO LUẬN CỘNG ĐỒNG ({article.metadata.get('comments', 0)} comments)",
+            value=truncate(comment_text, 900),
+            inline=False,
+        )
 
     tags = summary.get("tags", [])
     if tags:
-        embed.add_field(name="🏷️ Tags", value=" · ".join(tags[:6]), inline=False)
+        tag_str = " · ".join(f"`{t}`" for t in tags[:6])
+        embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
 
     footer_parts = [icon]
     if article.metadata.get("points"):
         footer_parts.append(f"👍 {article.metadata['points']}")
     if article.metadata.get("comments"):
         footer_parts.append(f"💬 {article.metadata['comments']}")
-    if article.metadata.get("upvotes"):
-        footer_parts.append(f"⬆️ {article.metadata['upvotes']}")
-    if article.metadata.get("downloads"):
-        footer_parts.append(f"⬇️ {article.metadata['downloads']}")
     if article.published_at:
         footer_parts.append(article.published_at.strftime("%d/%m %H:%M"))
 
     embed.set_footer(text=" · ".join(footer_parts))
     return embed
+
+
+def build_paper_embed(article: Article, summary: dict) -> discord.Embed:
+    color = CATEGORY_COLORS["papers"]
+    icon = SOURCE_ICONS.get(article.source, article.source)
+
+    embed = discord.Embed(
+        title=truncate(article.title, 250),
+        url=article.url,
+        color=color,
+    )
+
+    if article.author:
+        embed.set_author(name=truncate(article.author, 200))
+
+    tldr = summary.get("tldr", "")
+    if tldr:
+        embed.description = f"**📌 TÓM TẮT**\n{truncate(tldr, 800)}"
+
+    problem = summary.get("problem", "")
+    if problem and problem.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="❓ VẤN ĐỀ", value=truncate(problem, 900), inline=False)
+
+    method = summary.get("method", "")
+    if method and method.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="🔬 PHƯƠNG PHÁP", value=truncate(method, 900), inline=False)
+
+    results = summary.get("results", [])
+    if isinstance(results, list) and results:
+        value = "\n".join(f"• {truncate(r, 250)}" for r in results[:5])
+        embed.add_field(name="📊 KẾT QUẢ", value=truncate(value, 1000), inline=False)
+    elif isinstance(results, str) and results:
+        embed.add_field(name="📊 KẾT QUẢ", value=truncate(results, 900), inline=False)
+
+    limitations = summary.get("limitations", "")
+    if limitations and limitations.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="⚠️ HẠN CHẾ", value=truncate(limitations, 800), inline=False)
+
+    applications = summary.get("applications", "")
+    if applications and applications.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="💼 ỨNG DỤNG", value=truncate(applications, 800), inline=False)
+
+    tags = summary.get("tags", [])
+    if tags:
+        tag_str = " · ".join(f"`{t}`" for t in tags[:6])
+        embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
+
+    links = []
+    if article.metadata.get("arxiv_url"):
+        links.append(f"[arXiv]({article.metadata['arxiv_url']})")
+    if article.metadata.get("pdf_url"):
+        links.append(f"[PDF]({article.metadata['pdf_url']})")
+    if article.metadata.get("hf_url"):
+        links.append(f"[HF]({article.metadata['hf_url']})")
+    if links:
+        embed.add_field(name="🔗 Links", value=" · ".join(links), inline=False)
+
+    footer_parts = [icon]
+    if article.metadata.get("upvotes"):
+        footer_parts.append(f"⬆️ {article.metadata['upvotes']}")
+    if article.published_at:
+        footer_parts.append(article.published_at.strftime("%d/%m %H:%M"))
+
+    embed.set_footer(text=" · ".join(footer_parts))
+    return embed
+
+
+def build_model_embed(article: Article, summary: dict) -> discord.Embed:
+    color = CATEGORY_COLORS["models"]
+    icon = SOURCE_ICONS.get(article.source, article.source)
+
+    embed = discord.Embed(
+        title=truncate(article.title, 250),
+        url=article.url,
+        color=color,
+    )
+
+    tldr = summary.get("tldr", "")
+    if tldr:
+        embed.description = f"**📌 GIỚI THIỆU**\n{truncate(tldr, 800)}"
+
+    specs = summary.get("specs", {})
+    if isinstance(specs, dict) and specs:
+        spec_parts = []
+        if specs.get("task"):
+            spec_parts.append(f"**Task:** {truncate(specs['task'], 80)}")
+        if specs.get("params") and specs["params"].lower() != "không rõ":
+            spec_parts.append(f"**Params:** {truncate(specs['params'], 50)}")
+        if specs.get("context") and specs["context"].lower() != "không rõ":
+            spec_parts.append(f"**Context:** {truncate(specs['context'], 50)}")
+        if specs.get("license"):
+            spec_parts.append(f"**License:** {truncate(specs['license'], 50)}")
+        if specs.get("library"):
+            spec_parts.append(f"**Library:** {truncate(specs['library'], 50)}")
+        if spec_parts:
+            embed.add_field(
+                name="📋 THÔNG SỐ",
+                value=truncate("\n".join(spec_parts), 1000),
+                inline=False,
+            )
+
+    strengths = summary.get("strengths", [])
+    if isinstance(strengths, list) and strengths:
+        value = "\n".join(f"✅ {truncate(s, 200)}" for s in strengths[:4])
+        embed.add_field(name="ĐIỂM MẠNH", value=truncate(value, 900), inline=False)
+
+    weaknesses = summary.get("weaknesses", [])
+    if isinstance(weaknesses, list) and weaknesses:
+        value = "\n".join(f"⚠️ {truncate(w, 200)}" for w in weaknesses[:4])
+        embed.add_field(name="HẠN CHẾ", value=truncate(value, 900), inline=False)
+
+    use_cases = summary.get("use_cases", "")
+    if use_cases and use_cases.lower() not in ("không có thông tin trong bài", "không rõ"):
+        embed.add_field(name="💼 USE CASE", value=truncate(use_cases, 800), inline=False)
+
+    code = summary.get("code_snippet", "")
+    if code and len(code) > 10:
+        code_block = f"```python\n{truncate(code, 800)}\n```"
+        embed.add_field(name="💻 CÁCH DÙNG", value=code_block, inline=False)
+
+    tags = summary.get("tags", [])
+    if tags:
+        tag_str = " · ".join(f"`{t}`" for t in tags[:6])
+        embed.add_field(name="🏷️ Tags", value=truncate(tag_str, 300), inline=False)
+
+    footer_parts = [icon]
+    if article.metadata.get("downloads"):
+        footer_parts.append(f"⬇️ {article.metadata['downloads']:,}")
+    if article.metadata.get("likes"):
+        footer_parts.append(f"❤️ {article.metadata['likes']}")
+    if article.published_at:
+        footer_parts.append(article.published_at.strftime("%d/%m %H:%M"))
+
+    embed.set_footer(text=" · ".join(footer_parts))
+    return embed
+
+
+def build_embed(article: Article, summary: dict) -> discord.Embed:
+    if article.category == "papers":
+        return build_paper_embed(article, summary)
+    if article.category == "models":
+        return build_model_embed(article, summary)
+    return build_news_embed(article, summary)
 
 
 def get_channel_id(category: str) -> int:
@@ -723,7 +1140,7 @@ async def send_log(bot: discord.Client, message: str):
         if channel is None:
             channel = await bot.fetch_channel(CHANNEL_LOGS_ID)
         if channel:
-            await channel.send(f"```{message[:1900]}```")
+            await channel.send(f"```{truncate(message, 1900)}```")
     except Exception as e:
         logger.error(f"[Log] Failed to send log: {e}")
 
@@ -743,9 +1160,13 @@ async def push_article(
             channel = await bot.fetch_channel(channel_id)
         except Exception as e:
             logger.error(f"[Push] Channel {channel_id} not found: {e}")
-            await send_log(bot, f"[Push] Channel {channel_id} not found: {e}")
             await db.mark_failed(
-                article.source, article.external_id, article.url, article.title, "channel not found"
+                article.source,
+                article.external_id,
+                article.canonical_url,
+                article.url,
+                article.title,
+                "channel not found",
             )
             return
 
@@ -761,34 +1182,59 @@ async def push_article(
             await db.mark_sent(
                 article.source,
                 article.external_id,
+                article.canonical_url,
                 article.url,
                 article.title,
                 channel_id,
                 msg.id,
             )
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
 
         except discord.Forbidden:
             error_msg = "Bot lacks permission to send messages in this channel"
             logger.error(f"[Push] {error_msg} ({channel_id})")
             await send_log(bot, f"[Push] {error_msg}")
             await db.mark_failed(
-                article.source, article.external_id, article.url, article.title, error_msg
+                article.source,
+                article.external_id,
+                article.canonical_url,
+                article.url,
+                article.title,
+                error_msg,
             )
 
         except discord.NotFound:
             error_msg = "Channel not found or deleted"
             logger.error(f"[Push] {error_msg} ({channel_id})")
-            await send_log(bot, f"[Push] {error_msg}")
             await db.mark_failed(
-                article.source, article.external_id, article.url, article.title, error_msg
+                article.source,
+                article.external_id,
+                article.canonical_url,
+                article.url,
+                article.title,
+                error_msg,
+            )
+
+        except discord.HTTPException as e:
+            logger.error(f"[Push] Discord HTTP error for {article.title[:60]}: {e}")
+            await db.mark_failed(
+                article.source,
+                article.external_id,
+                article.canonical_url,
+                article.url,
+                article.title,
+                str(e),
             )
 
         except Exception as e:
-            logger.error(f"[Push] Failed to send {article.title[:60]}: {e}")
-            await send_log(bot, f"[Push] Failed to send {article.title[:60]}: {e}")
+            logger.exception(f"[Push] Unexpected error for {article.title[:60]}: {e}")
             await db.mark_failed(
-                article.source, article.external_id, article.url, article.title, str(e)
+                article.source,
+                article.external_id,
+                article.canonical_url,
+                article.url,
+                article.title,
+                str(e),
             )
 
 
@@ -811,8 +1257,8 @@ class DeniaBot(discord.Client):
         self.fetchers = [
             HackerNewsFetcher(),
             HuggingFacePapersFetcher(),
-            HuggingFaceModelsFetcher(),
             ArxivFetcher(),
+            HuggingFaceModelsFetcher(),
             RSSFetcher(
                 name="mit_tech",
                 rss_url="https://www.technologyreview.com/topic/artificial-intelligence/feed/",
@@ -831,19 +1277,22 @@ class DeniaBot(discord.Client):
             minutes=15,
             id="pipeline",
             max_instances=1,
+            next_run_time=datetime.now() + timedelta(seconds=30),
         )
         self.scheduler.start()
         logger.info("🐱 DeniaNewsCatcher ready!")
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
-        asyncio.create_task(self.run_pipeline())
 
     async def on_disconnect(self):
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
         if self.mistral:
-            await self.mistral.close()
+            try:
+                await self.mistral.close()
+            except Exception as e:
+                logger.error(f"[Shutdown] Mistral close failed: {e}")
             self.mistral = None
         if self.db:
             await self.db.close()
@@ -855,12 +1304,13 @@ class DeniaBot(discord.Client):
             return
 
         async with self._lock:
-            logger.info("=" * 50)
+            logger.info("=" * 60)
             logger.info("[Pipeline] Starting cycle")
 
             total_sent = 0
             for fetcher in self.fetchers:
                 try:
+                    logger.info(f"[Pipeline] Fetching from {fetcher.name}")
                     articles = await fetcher.fetch()
                     if not articles:
                         continue
@@ -869,6 +1319,7 @@ class DeniaBot(discord.Client):
                     if not new_articles:
                         continue
 
+                    logger.info(f"[Pipeline] Summarizing {len(new_articles)} new articles from {fetcher.name}")
                     summarized = await summarize_articles(self.mistral, new_articles)
 
                     for article, summary in summarized:
@@ -879,12 +1330,13 @@ class DeniaBot(discord.Client):
 
                 except Exception as e:
                     logger.exception(f"[Pipeline] Fetcher {fetcher.name} error: {e}")
-                    await send_log(self, f"[Pipeline] Fetcher {fetcher.name} error: {e}")
+                    await send_log(self, f"[Pipeline] {fetcher.name} error: {e}")
 
             stats = await self.db.get_stats()
             logger.info(
                 f"[Pipeline] Done. Sent {total_sent} this cycle. Total: {stats['total_sent']}"
             )
+            logger.info("=" * 60)
 
 
 def main():
