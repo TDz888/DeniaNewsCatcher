@@ -35,13 +35,13 @@ LLM_MODEL = os.getenv("LLM_MODEL", "mistral-small-latest")
 DB_PATH = os.getenv("DB_PATH", "/data/denia.db")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "100"))
+HN_MIN_SCORE = int(os.getenv("HN_MIN_SCORE", "150"))
 HN_MIN_COMMENTS = int(os.getenv("HN_MIN_COMMENTS", "20"))
-MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "5"))
+MAX_ARTICLES_PER_SOURCE = int(os.getenv("MAX_ARTICLES_PER_SOURCE", "3"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1500"))
-LLM_RATE_INTERVAL = float(os.getenv("LLM_RATE_INTERVAL", "1.2"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+LLM_RATE_INTERVAL = float(os.getenv("LLM_RATE_INTERVAL", "30.0"))
 
 logger.remove()
 logger.add(
@@ -132,6 +132,8 @@ def validate_config() -> list[str]:
         errors.append("CHANNEL_MODELS_ID is required")
     if CHANNEL_LOGS_ID == 0:
         errors.append("CHANNEL_LOGS_ID is required")
+    if LLM_RATE_INTERVAL < 30:
+        errors.append("LLM_RATE_INTERVAL must be at least 30 seconds for Mistral free tier")
     return errors
 
 
@@ -820,18 +822,22 @@ def get_prompt(category: str) -> str:
 
 
 class LLMRateLimiter:
-    def __init__(self, min_interval: float = 1.2):
+    def __init__(self, min_interval: float = 30.0):
         self.min_interval = min_interval
         self._last_call = 0.0
         self._lock = asyncio.Lock()
 
-    async def __aenter__(self):
+    async def acquire(self):
         async with self._lock:
             now = asyncio.get_event_loop().time()
             wait = self._last_call + self.min_interval - now
             if wait > 0:
+                logger.debug(f"[RateLimiter] Waiting {wait:.1f}s before next LLM call")
                 await asyncio.sleep(wait)
             self._last_call = asyncio.get_event_loop().time()
+
+    async def __aenter__(self):
+        await self.acquire()
         return self
 
     async def __aexit__(self, *args):
@@ -905,7 +911,7 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
                 f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
             )
             if attempt < LLM_MAX_RETRIES - 1:
-                wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                wait = min(120, (2 ** attempt) * 30 + random.uniform(0, 5))
                 await asyncio.sleep(wait)
 
         except asyncio.TimeoutError:
@@ -914,14 +920,25 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
                 f"(attempt {attempt + 1}/{LLM_MAX_RETRIES})"
             )
             if attempt < LLM_MAX_RETRIES - 1:
-                wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                wait = min(120, (2 ** attempt) * 30 + random.uniform(0, 5))
                 await asyncio.sleep(wait)
 
         except Exception as e:
             error_str = str(e)
 
             if "429" in error_str or "rate" in error_str.lower():
-                wait = min(120, (2 ** attempt) + random.uniform(0, 1))
+                retry_after = None
+                if hasattr(e, "response") and e.response is not None:
+                    retry_after = e.response.headers.get("Retry-After")
+
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait = min(300, (2 ** attempt) * 60 + random.uniform(0, 10))
+                else:
+                    wait = min(300, (2 ** attempt) * 60 + random.uniform(0, 10))
+
                 logger.warning(
                     f"[LLM] Rate limited for '{article.title[:60]}' "
                     f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}), waiting {wait:.1f}s"
@@ -933,7 +950,7 @@ async def summarize(client: Mistral, article: Article) -> dict | None:
                     f"(attempt {attempt + 1}/{LLM_MAX_RETRIES}): {e}"
                 )
                 if attempt < LLM_MAX_RETRIES - 1:
-                    wait = min(60, (2 ** attempt) + random.uniform(0, 1))
+                    wait = min(120, (2 ** attempt) * 30 + random.uniform(0, 5))
                     await asyncio.sleep(wait)
 
     logger.error(f"[LLM] Gave up on '{article.title[:60]}' after {LLM_MAX_RETRIES} attempts")
@@ -1015,21 +1032,21 @@ def build_news_embed(article: Article, summary: dict) -> discord.Embed:
     key_points = summary.get("key_points", [])
     if isinstance(key_points, list) and key_points:
         value = "\n".join(f"• {truncate(str(p), 200)}" for p in key_points[:5])
-        embed.add_field(name="🔑 ĐIỂM CHÍNH", value=truncate(value, 1000), inline=False)
+        embed.add_field(name="🔑 ĐIỂM CHÍNH", value=truncate(value, 1024), inline=False)
 
     context = summary.get("context", "")
     if context and context.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="💡 BỐI CẢNH", value=truncate(context, 900), inline=False)
+        embed.add_field(name="💡 BỐI CẢNH", value=truncate(context, 1024), inline=False)
 
     impact = summary.get("impact", "")
     if impact and impact.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="🎯 TÁC ĐỘNG", value=truncate(impact, 900), inline=False)
+        embed.add_field(name="🎯 TÁC ĐỘNG", value=truncate(impact, 1024), inline=False)
 
     if article.comments:
         comment_text = "\n".join(f"• {truncate(c, 180)}" for c in article.comments[:4])
         embed.add_field(
             name=f"💬 THẢO LUẬN ({article.metadata.get('comments', 0)} comments)",
-            value=truncate(comment_text, 900),
+            value=truncate(comment_text, 1024),
             inline=False,
         )
 
@@ -1069,26 +1086,26 @@ def build_paper_embed(article: Article, summary: dict) -> discord.Embed:
 
     problem = summary.get("problem", "")
     if problem and problem.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="❓ VẤN ĐỀ", value=truncate(problem, 900), inline=False)
+        embed.add_field(name="❓ VẤN ĐỀ", value=truncate(problem, 1024), inline=False)
 
     method = summary.get("method", "")
     if method and method.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="🔬 PHƯƠNG PHÁP", value=truncate(method, 900), inline=False)
+        embed.add_field(name="🔬 PHƯƠNG PHÁP", value=truncate(method, 1024), inline=False)
 
     results = summary.get("results", [])
     if isinstance(results, list) and results:
         value = "\n".join(f"• {truncate(str(r), 250)}" for r in results[:5])
-        embed.add_field(name="📊 KẾT QUẢ", value=truncate(value, 1000), inline=False)
+        embed.add_field(name="📊 KẾT QUẢ", value=truncate(value, 1024), inline=False)
     elif isinstance(results, str) and results:
-        embed.add_field(name="📊 KẾT QUẢ", value=truncate(results, 900), inline=False)
+        embed.add_field(name="📊 KẾT QUẢ", value=truncate(results, 1024), inline=False)
 
     limitations = summary.get("limitations", "")
     if limitations and limitations.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="⚠️ HẠN CHẾ", value=truncate(limitations, 800), inline=False)
+        embed.add_field(name="⚠️ HẠN CHẾ", value=truncate(limitations, 1024), inline=False)
 
     applications = summary.get("applications", "")
     if applications and applications.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="💼 ỨNG DỤNG", value=truncate(applications, 800), inline=False)
+        embed.add_field(name="💼 ỨNG DỤNG", value=truncate(applications, 1024), inline=False)
 
     tags = summary.get("tags", [])
     if isinstance(tags, list) and tags:
@@ -1145,23 +1162,23 @@ def build_model_embed(article: Article, summary: dict) -> discord.Embed:
         if spec_parts:
             embed.add_field(
                 name="📋 THÔNG SỐ",
-                value=truncate("\n".join(spec_parts), 1000),
+                value=truncate("\n".join(spec_parts), 1024),
                 inline=False,
             )
 
     strengths = summary.get("strengths", [])
     if isinstance(strengths, list) and strengths:
         value = "\n".join(f"✅ {truncate(str(s), 200)}" for s in strengths[:4])
-        embed.add_field(name="ĐIỂM MẠNH", value=truncate(value, 900), inline=False)
+        embed.add_field(name="ĐIỂM MẠNH", value=truncate(value, 1024), inline=False)
 
     weaknesses = summary.get("weaknesses", [])
     if isinstance(weaknesses, list) and weaknesses:
         value = "\n".join(f"⚠️ {truncate(str(w), 200)}" for w in weaknesses[:4])
-        embed.add_field(name="HẠN CHẾ", value=truncate(value, 900), inline=False)
+        embed.add_field(name="HẠN CHẾ", value=truncate(value, 1024), inline=False)
 
     use_cases = summary.get("use_cases", "")
     if use_cases and use_cases.lower() not in ("không có thông tin trong bài", "không rõ"):
-        embed.add_field(name="💼 USE CASE", value=truncate(use_cases, 800), inline=False)
+        embed.add_field(name="💼 USE CASE", value=truncate(use_cases, 1024), inline=False)
 
     code = summary.get("code_snippet", "")
     if code and len(code) > 10:
@@ -1321,7 +1338,7 @@ class DeniaBot(discord.Client):
     async def setup_hook(self):
         self.db = DatabaseManager(DB_PATH)
         await self.db.connect()
-        self.mistral = Mistral(api_key=MISTRAL_API_KEY)
+        self.mistral = Mistral(api_key=MISTRAL_API_KEY, max_retries=5)
 
         self.fetchers = [
             HackerNewsFetcher(),
