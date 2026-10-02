@@ -9,7 +9,7 @@ import aiosqlite
 import discord
 from dotenv import load_dotenv
 from loguru import logger
-from mistralai.client import Mistral
+from openai import AsyncOpenAI
 
 load_dotenv()
 
@@ -17,6 +17,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DISCORD_OWNER_ID = int(os.getenv("DISCORD_OWNER_ID", "0"))
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "mistral-small-latest")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://www.cocolink.ai/v1")
 DB_PATH = os.getenv("DB_PATH", "/data/denia.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LLM_RATE_INTERVAL = float(os.getenv("LLM_RATE_INTERVAL", "30"))
@@ -156,15 +157,6 @@ Denia: "Oke để em gọn cho sếp nha~ 🤓
 • `await` → chờ task xong, nhường CPU cho task khác
 • Chạy nhiều task cùng lúc → nhanh hơn sync rõ rệt
 
-**Ví dụ:**
-```
-
-async def fetch():
-async with httpx.AsyncClient() as c:
-return await c.get(url)
-
-```
-
 Dùng khi gọi API, đọc file, query DB — task nào có I/O wait. Sếp cần ví dụ thực tế hơn hông?"
 
 Ví dụ 4 — User vui vẻ:
@@ -196,10 +188,12 @@ def validate_config() -> list[str]:
         errors.append("DISCORD_TOKEN is required")
     if not MISTRAL_API_KEY:
         errors.append("MISTRAL_API_KEY is required")
+    if not LLM_BASE_URL:
+        errors.append("LLM_BASE_URL is required")
     if DISCORD_OWNER_ID == 0:
         errors.append("DISCORD_OWNER_ID is required")
-    if LLM_RATE_INTERVAL < 10:
-        errors.append("LLM_RATE_INTERVAL must be at least 10 seconds")
+    if LLM_RATE_INTERVAL < 5:
+        errors.append("LLM_RATE_INTERVAL must be at least 5 seconds")
     return errors
 
 
@@ -420,7 +414,7 @@ class DatabaseManager:
 
 
 async def call_llm(
-    client: Mistral,
+    client: AsyncOpenAI,
     system_prompt: str,
     history: list[dict[str, str]],
     user_message: str,
@@ -434,7 +428,7 @@ async def call_llm(
         try:
             await limiter.acquire()
             async with asyncio.timeout(LLM_TIMEOUT):
-                resp = await client.chat.complete_async(
+                resp = await client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=messages,
                     temperature=LLM_TEMPERATURE,
@@ -454,11 +448,14 @@ async def call_llm(
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "rate" in error_str:
-                wait = 60 * (attempt + 1)
+                wait = 30 * (attempt + 1)
                 logger.warning(f"[LLM] Rate limited, waiting {wait}s")
                 await asyncio.sleep(wait)
             elif "401" in error_str or "unauthorized" in error_str:
                 logger.error("[LLM] Invalid API key")
+                return None
+            elif "404" in error_str or "not found" in error_str:
+                logger.error(f"[LLM] Model or endpoint not found: {e}")
                 return None
             else:
                 logger.error(f"[LLM] Failed (attempt {attempt + 1}/3): {e}")
@@ -475,7 +472,7 @@ class DeniaBot(discord.Client):
         intents.dm_messages = True
         super().__init__(intents=intents)
         self.db: DatabaseManager | None = None
-        self.mistral: Mistral | None = None
+        self.llm: AsyncOpenAI | None = None
         self.llm_limiter = RateLimiter(LLM_RATE_INTERVAL)
         self.cooldown = UserCooldown(USER_COOLDOWN)
         self._processing: set[int] = set()
@@ -484,23 +481,28 @@ class DeniaBot(discord.Client):
     async def setup_hook(self) -> None:
         self.db = DatabaseManager(DB_PATH)
         await self.db.connect()
-        self.mistral = Mistral(api_key=MISTRAL_API_KEY)
+        self.llm = AsyncOpenAI(
+            api_key=MISTRAL_API_KEY,
+            base_url=LLM_BASE_URL,
+            timeout=LLM_TIMEOUT,
+        )
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        logger.info("🐱 DeniaGPT ready!")
+        logger.info(f"🐱 DeniaGPT ready! LLM base: {LLM_BASE_URL}")
 
     async def on_ready(self) -> None:
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         logger.info(f"Owner ID: {DISCORD_OWNER_ID}")
+        logger.info(f"Model: {LLM_MODEL}")
 
     async def on_disconnect(self) -> None:
         if self._cleanup_task:
             self._cleanup_task.cancel()
-        if self.mistral:
+        if self.llm:
             try:
-                await self.mistral.close()
+                await self.llm.close()
             except Exception:
                 pass
-            self.mistral = None
+            self.llm = None
         if self.db:
             await self.db.close()
         logger.info("DeniaGPT disconnected")
@@ -581,14 +583,18 @@ class DeniaBot(discord.Client):
                 user_id, channel_id, HISTORY_LIMIT
             )
 
-            if history and history[-1].get("role") == "user" and history[-1].get("content") == user_text:
+            if (
+                history
+                and history[-1].get("role") == "user"
+                and history[-1].get("content") == user_text
+            ):
                 history = history[:-1]
 
             system_prompt = build_system_prompt(owner)
 
             async with message.channel.typing():
                 reply = await call_llm(
-                    self.mistral,
+                    self.llm,
                     system_prompt,
                     history,
                     user_text,
