@@ -5,11 +5,11 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import discord
 import psutil
-import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from discord import app_commands
 from dotenv import load_dotenv
@@ -210,6 +210,10 @@ def validate_config() -> list[str]:
         errors.append("DISCORD_OWNER_ID is required")
     if LLM_RATE_INTERVAL < 1:
         errors.append("LLM_RATE_INTERVAL must be at least 1 second")
+    try:
+        ZoneInfo(TIMEZONE)
+    except Exception:
+        errors.append(f"Invalid TIMEZONE: {TIMEZONE}")
     return errors
 
 
@@ -601,7 +605,7 @@ class DeniaBot(discord.Client):
         self._processing: set[int] = set()
         self._cleanup_task: asyncio.Task | None = None
         self._start_time = time.time()
-        self.scheduler = AsyncIOScheduler(timezone=pytz.timezone(TIMEZONE))
+        self.scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
 
     async def setup_hook(self) -> None:
         self.db = DatabaseManager(DB_PATH)
@@ -632,7 +636,7 @@ class DeniaBot(discord.Client):
             try:
                 status = await collect_system_status(sample_seconds=0.6)
                 bot_uptime = time.time() - self._start_time
-                now_tz = datetime.now(pytz.timezone(TIMEZONE))
+                now_tz = datetime.now(ZoneInfo(TIMEZONE))
 
                 embed = discord.Embed(
                     title="🐱 DeniaGPT — Trạng thái hệ thống",
