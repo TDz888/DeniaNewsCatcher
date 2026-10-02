@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 import aiosqlite
 import discord
 import psutil
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from discord import app_commands
 from dotenv import load_dotenv
 from loguru import logger
@@ -604,8 +603,9 @@ class DeniaBot(discord.Client):
         self.cooldown = UserCooldown(USER_COOLDOWN)
         self._processing: set[int] = set()
         self._cleanup_task: asyncio.Task | None = None
+        self._scheduler_task: asyncio.Task | None = None
         self._start_time = time.time()
-        self.scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
+        self._last_greeting_date: dict[str, str] = {}
 
     async def setup_hook(self) -> None:
         self.db = DatabaseManager(DB_PATH)
@@ -618,6 +618,7 @@ class DeniaBot(discord.Client):
         )
 
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
         @self.tree.command(
             name="status",
@@ -701,24 +702,6 @@ class DeniaBot(discord.Client):
         except Exception as e:
             logger.error(f"Failed to sync slash commands: {e}")
 
-        self.scheduler.add_job(
-            self.send_good_morning,
-            "cron",
-            hour=GOOD_MORNING_HOUR,
-            minute=0,
-            id="good_morning",
-            replace_existing=True,
-        )
-        self.scheduler.add_job(
-            self.send_good_night,
-            "cron",
-            hour=GOOD_NIGHT_HOUR,
-            minute=0,
-            id="good_night",
-            replace_existing=True,
-        )
-        self.scheduler.start()
-
         logger.info(
             f"🐱 DeniaGPT ready! LLM: {LLM_BASE_URL} | Model: {LLM_MODEL}"
         )
@@ -730,10 +713,9 @@ class DeniaBot(discord.Client):
             logger.info(f"Guild ID: {GUILD_ID}")
 
     async def on_disconnect(self) -> None:
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
+        for task in [self._cleanup_task, self._scheduler_task]:
+            if task:
+                task.cancel()
         if self.llm:
             try:
                 await self.llm.close()
@@ -756,6 +738,37 @@ class DeniaBot(discord.Client):
                 break
             except Exception as e:
                 logger.error(f"[Cleanup] Error: {e}")
+
+    async def _scheduler_loop(self) -> None:
+        tz = ZoneInfo(TIMEZONE)
+        while True:
+            try:
+                now = datetime.now(tz)
+                today_key = now.strftime("%Y-%m-%d")
+                current_hour = now.hour
+                current_minute = now.minute
+
+                if current_minute == 0:
+                    if (
+                        current_hour == GOOD_MORNING_HOUR
+                        and self._last_greeting_date.get("morning") != today_key
+                    ):
+                        self._last_greeting_date["morning"] = today_key
+                        await self.send_good_morning()
+
+                    if (
+                        current_hour == GOOD_NIGHT_HOUR
+                        and self._last_greeting_date.get("night") != today_key
+                    ):
+                        self._last_greeting_date["night"] = today_key
+                        await self.send_good_night()
+
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Scheduler] Error: {e}")
+                await asyncio.sleep(60)
 
     async def _get_owner_dm(self) -> discord.User | None:
         user = self.get_user(DISCORD_OWNER_ID)
