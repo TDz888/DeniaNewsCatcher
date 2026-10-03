@@ -54,33 +54,14 @@ logger.add(
     colorize=True,
 )
 
-
 TRIGGER_WORDS = [
-    "denia",
-    "deniagpt",
-    "denia gpt",
-    "denia ơi",
-    "denia à",
-    "denia nè",
-    "cục cưng",
-    "cục cưng ơi",
-    "cưng ơi",
-    "cưng à",
-    "em ơi",
-    "em à",
-    "bot ơi",
-    "bot à",
-    "hey denia",
-    "hi denia",
-    "hello denia",
-    "hey bot",
-    "hi bot",
-    "hello bot",
-    "gọi denia",
-    "kêu denia",
-    "denia đâu",
+    "denia", "deniagpt", "denia gpt", "denia ơi", "denia à", "denia nè",
+    "cục cưng", "cục cưng ơi", "cưng ơi", "cưng à",
+    "em ơi", "em à", "bot ơi", "bot à",
+    "hey denia", "hi denia", "hello denia",
+    "hey bot", "hi bot", "hello bot",
+    "gọi denia", "kêu denia", "denia đâu",
 ]
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -106,7 +87,6 @@ CREATE INDEX IF NOT EXISTS idx_conv_user_channel
 CREATE INDEX IF NOT EXISTS idx_conv_created
     ON conversations(created_at DESC);
 """
-
 
 BASE_PROMPT = """Bạn là DeniaGPT — trợ lý AI cá nhân dễ thương, năng động, Gen Z.
 
@@ -441,6 +421,7 @@ class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -453,86 +434,169 @@ class DatabaseManager:
         logger.info(f"Database connected at {self.db_path}")
 
     async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
-            logger.info("Database closed")
+        async with self._lock:
+            if self._conn:
+                try:
+                    await self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                logger.info("Database closed")
+
+    async def _ensure_conn(self) -> bool:
+        if self._conn is not None:
+            return True
+        try:
+            logger.warning("[DB] Connection lost, reconnecting...")
+            await self.connect()
+            return True
+        except Exception as e:
+            logger.error(f"[DB] Reconnect failed: {e}")
+            return False
 
     async def ensure_user(
         self, user_id: int, display_name: str, owner: bool
     ) -> None:
-        if self._conn is None:
+        if not await self._ensure_conn():
             return
-        await self._conn.execute(
-            """
-            INSERT INTO users (user_id, display_name, is_owner, message_count, last_seen)
-            VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                last_seen = CURRENT_TIMESTAMP,
-                message_count = users.message_count + 1
-            """,
-            (user_id, display_name, 1 if owner else 0),
-        )
-        await self._conn.commit()
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO users (user_id, display_name, is_owner, message_count, last_seen)
+                VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    last_seen = CURRENT_TIMESTAMP,
+                    message_count = users.message_count + 1
+                """,
+                (user_id, display_name, 1 if owner else 0),
+            )
+            await self._conn.commit()
+        except Exception as e:
+            logger.error(f"[DB] ensure_user failed: {e}")
 
     async def save_message(
         self, user_id: int, channel_id: int, role: str, content: str
     ) -> None:
-        if self._conn is None:
+        if not await self._ensure_conn():
             return
-        await self._conn.execute(
-            """
-            INSERT INTO conversations (user_id, channel_id, role, content)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, channel_id, role, content),
-        )
-        await self._conn.commit()
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO conversations (user_id, channel_id, role, content)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, channel_id, role, content),
+            )
+            await self._conn.commit()
+        except Exception as e:
+            logger.error(f"[DB] save_message failed: {e}")
 
     async def load_history(
         self, user_id: int, channel_id: int, limit: int
     ) -> list[dict[str, str]]:
-        if self._conn is None:
+        if not await self._ensure_conn():
             return []
-        async with self._conn.execute(
-            """
-            SELECT role, content FROM conversations
-            WHERE user_id = ? AND channel_id = ?
-            ORDER BY id DESC LIMIT ?
-            """,
-            (user_id, channel_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        try:
+            async with self._conn.execute(
+                """
+                SELECT role, content FROM conversations
+                WHERE user_id = ? AND channel_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (user_id, channel_id, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+            return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        except Exception as e:
+            logger.error(f"[DB] load_history failed: {e}")
+            return []
 
     async def get_user_stats(self, user_id: int) -> dict:
-        if self._conn is None:
+        if not await self._ensure_conn():
             return {}
-        async with self._conn.execute(
-            "SELECT display_name, message_count, is_owner FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
+        try:
+            async with self._conn.execute(
+                "SELECT display_name, message_count, is_owner FROM users WHERE user_id = ?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return {}
+            return {
+                "display_name": row[0],
+                "message_count": row[1],
+                "is_owner": bool(row[2]),
+            }
+        except Exception as e:
+            logger.error(f"[DB] get_user_stats failed: {e}")
             return {}
-        return {
-            "display_name": row[0],
-            "message_count": row[1],
-            "is_owner": bool(row[2]),
-        }
 
     async def cleanup_old(self, days: int = 14) -> int:
-        if self._conn is None:
+        if not await self._ensure_conn():
             return 0
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        async with self._conn.execute(
-            "DELETE FROM conversations WHERE created_at < ?",
-            (cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
-        ) as cur:
-            deleted = cur.rowcount
-        await self._conn.commit()
-        return deleted
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            async with self._conn.execute(
+                "DELETE FROM conversations WHERE created_at < ?",
+                (cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
+            ) as cur:
+                deleted = cur.rowcount
+            await self._conn.commit()
+            return deleted
+        except Exception as e:
+            logger.error(f"[DB] cleanup_old failed: {e}")
+            return 0
+
+
+def _create_llm_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=MISTRAL_API_KEY,
+        base_url=LLM_BASE_URL,
+        timeout=LLM_TIMEOUT,
+        max_retries=0,
+    )
+
+
+async def verify_api_key() -> bool:
+    logger.info("[Verify] Checking API key...")
+    client = _create_llm_client()
+    try:
+        async with asyncio.timeout(30):
+            resp = await client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+                temperature=0,
+            )
+        if resp and resp.choices:
+            logger.info(
+                f"[Verify] API key OK — model '{LLM_MODEL}' reachable"
+            )
+            return True
+        logger.error("[Verify] API returned no choices")
+        return False
+    except asyncio.TimeoutError:
+        logger.error("[Verify] API key verification timed out (30s)")
+        return False
+    except Exception as e:
+        error_str = str(e).lower()
+        if "401" in error_str or "unauthorized" in error_str:
+            logger.error("[Verify] Invalid API key (401 Unauthorized)")
+        elif "404" in error_str or "not found" in error_str:
+            logger.error(
+                f"[Verify] Model '{LLM_MODEL}' not found at {LLM_BASE_URL}"
+            )
+        elif "403" in error_str or "forbidden" in error_str:
+            logger.error("[Verify] API key forbidden (403)")
+        else:
+            logger.error(f"[Verify] Failed: {e}")
+        return False
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 async def call_llm(
@@ -599,6 +663,7 @@ class DeniaBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.db: DatabaseManager | None = None
         self.llm: AsyncOpenAI | None = None
+        self._llm_lock = asyncio.Lock()
         self.llm_limiter = RateLimiter(LLM_RATE_INTERVAL)
         self.cooldown = UserCooldown(USER_COOLDOWN)
         self._processing: set[int] = set()
@@ -606,16 +671,33 @@ class DeniaBot(discord.Client):
         self._scheduler_task: asyncio.Task | None = None
         self._start_time = time.time()
         self._last_greeting_date: dict[str, str] = {}
+        self._shutting_down = False
+
+    async def _ensure_llm(self) -> AsyncOpenAI | None:
+        if self.llm is not None:
+            return self.llm
+        async with self._llm_lock:
+            if self.llm is not None:
+                return self.llm
+            try:
+                logger.info("[LLM] Creating new client...")
+                self.llm = _create_llm_client()
+                return self.llm
+            except Exception as e:
+                logger.error(f"[LLM] Client creation failed: {e}")
+                self.llm = None
+                return None
 
     async def setup_hook(self) -> None:
+        ok = await verify_api_key()
+        if not ok:
+            logger.error("API key verification failed. Shutting down.")
+            sys.exit(1)
+
         self.db = DatabaseManager(DB_PATH)
         await self.db.connect()
 
-        self.llm = AsyncOpenAI(
-            api_key=MISTRAL_API_KEY,
-            base_url=LLM_BASE_URL,
-            timeout=LLM_TIMEOUT,
-        )
+        self.llm = _create_llm_client()
 
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
@@ -712,9 +794,21 @@ class DeniaBot(discord.Client):
         if GUILD_ID:
             logger.info(f"Guild ID: {GUILD_ID}")
 
+    async def on_resumed(self) -> None:
+        logger.info("Connection resumed")
+
     async def on_disconnect(self) -> None:
+        if self._shutting_down:
+            return
+        logger.warning(
+            "[Connection] Lost connection to Discord. Will reconnect..."
+        )
+
+    async def close(self) -> None:
+        self._shutting_down = True
+        logger.info("Shutting down DeniaGPT...")
         for task in [self._cleanup_task, self._scheduler_task]:
-            if task:
+            if task and not task.done():
                 task.cancel()
         if self.llm:
             try:
@@ -724,7 +818,7 @@ class DeniaBot(discord.Client):
             self.llm = None
         if self.db:
             await self.db.close()
-        logger.info("DeniaGPT disconnected")
+        await super().close()
 
     async def _cleanup_loop(self) -> None:
         while True:
@@ -866,15 +960,19 @@ class DeniaBot(discord.Client):
                 f"{message.author.display_name}: {user_text[:80]}"
             )
 
-            assert self.db is not None
-            await self.db.ensure_user(
-                user_id, message.author.display_name, owner
-            )
-            await self.db.save_message(user_id, channel_id, "user", user_text)
+            if self.db is not None:
+                await self.db.ensure_user(
+                    user_id, message.author.display_name, owner
+                )
+                await self.db.save_message(
+                    user_id, channel_id, "user", user_text
+                )
 
-            history = await self.db.load_history(
-                user_id, channel_id, HISTORY_LIMIT
-            )
+            history: list[dict[str, str]] = []
+            if self.db is not None:
+                history = await self.db.load_history(
+                    user_id, channel_id, HISTORY_LIMIT
+                )
 
             if (
                 history
@@ -885,14 +983,22 @@ class DeniaBot(discord.Client):
 
             system_prompt = build_system_prompt(owner)
 
-            assert self.llm is not None
+            llm = await self._ensure_llm()
+            if llm is None:
+                logger.error("[on_message] LLM client unavailable")
+                try:
+                    await message.reply(
+                        "Em đang gặp trục trặc kỹ thuật xíu sếp ơi 🥺 "
+                        "Đợi em vài phút rồi thử lại nha~",
+                        mention_author=False,
+                    )
+                except Exception:
+                    pass
+                return
+
             async with message.channel.typing():
                 reply = await call_llm(
-                    self.llm,
-                    system_prompt,
-                    history,
-                    user_text,
-                    self.llm_limiter,
+                    llm, system_prompt, history, user_text, self.llm_limiter
                 )
 
             if not reply:
@@ -906,7 +1012,10 @@ class DeniaBot(discord.Client):
                     pass
                 return
 
-            await self.db.save_message(user_id, channel_id, "assistant", reply)
+            if self.db is not None:
+                await self.db.save_message(
+                    user_id, channel_id, "assistant", reply
+                )
 
             chunks = split_message(reply)
             for i, chunk in enumerate(chunks):
